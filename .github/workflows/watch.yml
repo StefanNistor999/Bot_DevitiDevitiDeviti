@@ -1,0 +1,46 @@
+name: 999.md apartment watch
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub treats this as best-effort and will skip or delay
+    # runs under load - expect real intervals of 5-20 minutes, not clockwork.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:       # lets you trigger a run by hand from the Actions tab
+
+permissions:
+  contents: write          # needed to commit seen.json back
+
+concurrency:
+  group: bot999
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check 999.md
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # page-1 check most runs; full deep sweep at most once an hour
+          FULL_SWEEP_EVERY_MIN: "60"
+        run: python3 bot999.py
+
+      - name: Persist seen listings
+        run: |
+          if [[ -n "$(git status --porcelain seen.json)" ]]; then
+            git config user.name  "bot999"
+            git config user.email "bot999@users.noreply.github.com"
+            git add seen.json
+            git commit -m "chore: update seen listings [skip ci]"
+            # the schedule fires often; another run may have pushed meanwhile
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
