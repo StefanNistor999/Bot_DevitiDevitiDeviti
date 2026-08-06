@@ -48,11 +48,15 @@ USD_PER_EUR = float(os.environ.get("USD_PER_EUR", 1.09))
 # Optional: only these room counts, e.g. "1,2,3". Empty = any.
 ROOMS_ALLOWED = [s.strip() for s in os.environ.get("ROOMS", "").split(",") if s.strip()]
 
-# The bot pages through the ENTIRE filtered result set each run, not just the
-# newest page - a matching listing can sit deep in the list if the seller never
-# bumps it. PAGE_SIZE is per request; MAX_PAGES is a runaway guard.
+# Two scan modes, so a frequent schedule stays cheap and polite:
+#   QUICK - just page 1 (newest listings land at the top; 1 request)
+#   FULL  - page through the entire filtered set (~5 requests), which also
+#           catches flats whose price was edited down into your band
+# A full sweep runs automatically if the last one was over FULL_SWEEP_EVERY_MIN
+# minutes ago; every other run is quick.
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", 100))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", 20))
+FULL_SWEEP_EVERY_MIN = int(os.environ.get("FULL_SWEEP_EVERY_MIN", 60))
 
 # Never fire more than this many messages in one run (flood guard).
 MAX_ALERTS_PER_RUN = int(os.environ.get("MAX_ALERTS_PER_RUN", 15))
@@ -141,8 +145,12 @@ def post_json(url, payload, headers=None, timeout=30):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def fetch_listings():
-    """Every listing matching the server-side filters, newest first."""
+def fetch_listings(quick=False):
+    """Listings matching the server-side filters, newest first.
+
+    quick=True fetches only the first page - enough to spot brand-new posts.
+    quick=False pages through the whole result set.
+    """
     region_ids = []
     for name in WATCH_REGIONS:
         if name not in REGIONS:
@@ -156,7 +164,7 @@ def fetch_listings():
         filters.insert(1, {"filterId": 32, "features": [{"featureId": 9, "optionIds": region_ids}]})
 
     ads, skip, total = [], 0, None
-    for _ in range(MAX_PAGES):
+    for _ in range(1 if quick else MAX_PAGES):
         payload = {
             "operationName": "SearchAds",
             "query": QUERY,
@@ -178,7 +186,7 @@ def fetch_listings():
         total = res["data"]["searchAds"]["count"]
         ads.extend(page)
         skip += PAGE_SIZE
-        if len(page) < PAGE_SIZE or skip >= (total or 0):
+        if quick or len(page) < PAGE_SIZE or skip >= (total or 0):
             break
         time.sleep(0.5)   # be polite to 999.md
     else:
@@ -317,19 +325,26 @@ def print_chat_id():
 # State
 # --------------------------------------------------------------------------
 
-def load_seen():
+def load_state():
     if not STATE_FILE.exists():
-        return set()
+        return {"seen": [], "last_full_sweep": 0}
     try:
-        return set(json.loads(STATE_FILE.read_text()).get("seen", []))
+        return json.loads(STATE_FILE.read_text())
     except (json.JSONDecodeError, OSError):
-        return set()
+        return {"seen": [], "last_full_sweep": 0}
 
 
-def save_seen(ids):
+def save_state(ids, last_full_sweep):
     # keep the store bounded - 5000 ids is far more than we ever need
-    trimmed = list(ids)[-5000:]
-    STATE_FILE.write_text(json.dumps({"seen": trimmed, "updated": time.strftime("%Y-%m-%d %H:%M:%S")}))
+    STATE_FILE.write_text(json.dumps({
+        "seen": sorted(ids)[-5000:],
+        "last_full_sweep": last_full_sweep,
+        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }, indent=0))
+
+
+def due_for_full_sweep(state):
+    return (time.time() - state.get("last_full_sweep", 0)) >= FULL_SWEEP_EVERY_MIN * 60
 
 
 # --------------------------------------------------------------------------
@@ -342,19 +357,37 @@ def main():
                     help="print what would be sent; don't send, don't save state")
     ap.add_argument("--chat-id", action="store_true",
                     help="print the chat id of whoever has messaged your bot, then exit")
+    ap.add_argument("--quick", action="store_true",
+                    help="force a page-1-only scan")
+    ap.add_argument("--full", action="store_true",
+                    help="force a full sweep of every page")
     args = ap.parse_args()
 
     if args.chat_id:
         print_chat_id()
         return
 
-    ads = fetch_listings()
+    state = load_state()
+    seen = set(state.get("seen", []))
+    last_full = state.get("last_full_sweep", 0)
+
+    # --seed and --dry-run always look at everything; otherwise a full sweep
+    # happens on schedule and every other run is a cheap page-1 check.
+    if args.full or args.seed or args.dry_run:
+        quick = False
+    elif args.quick:
+        quick = True
+    else:
+        quick = not due_for_full_sweep(state)
+
+    ads = fetch_listings(quick=quick)
+    if not quick:
+        last_full = time.time()
     hits = [a for a in ads if matches(a)]
-    seen = load_seen()
     fresh = [a for a in hits if a["id"] not in seen]
 
-    print(f"fetched {len(ads)} listings | {len(hits)} in {PRICE_MIN:.0f}-{PRICE_MAX:.0f} EUR "
-          f"| {len(fresh)} new")
+    print(f"{'quick' if quick else 'full'} scan | fetched {len(ads)} listings | "
+          f"{len(hits)} in {PRICE_MIN:.0f}-{PRICE_MAX:.0f} EUR | {len(fresh)} new")
 
     if args.dry_run:
         for ad in hits:
@@ -364,7 +397,7 @@ def main():
         return
 
     if args.seed:
-        save_seen(seen | {a["id"] for a in hits})
+        save_state(seen | {a["id"] for a in hits}, last_full)
         print(f"seeded {len(hits)} matching ids - future runs will only alert on new matches")
         return
 
@@ -381,7 +414,7 @@ def main():
     # Only MATCHING listings are remembered. A flat currently priced above your
     # band stays "unseen", so if the landlord later drops it into range, that
     # counts as new and you get pinged. Price drops are the point.
-    save_seen(seen | {a["id"] for a in hits})
+    save_state(seen | {a["id"] for a in hits}, last_full)
 
 
 if __name__ == "__main__":
