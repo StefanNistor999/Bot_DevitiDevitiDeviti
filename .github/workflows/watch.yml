@@ -19,9 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -33,14 +33,47 @@ jobs:
           FULL_SWEEP_EVERY_MIN: "60"
         run: python3 bot999.py
 
+      # seen.json is append-only state, so a "conflict" is never a real conflict:
+      # the correct result is always the union of both sides. Rebasing it was a
+      # mistake - this fetches whatever landed meanwhile, merges the id sets, and
+      # retries if someone pushes again mid-flight.
       - name: Persist seen listings
         run: |
-          if [[ -n "$(git status --porcelain seen.json)" ]]; then
-            git config user.name  "bot999"
-            git config user.email "bot999@users.noreply.github.com"
-            git add seen.json
-            git commit -m "chore: update seen listings [skip ci]"
-            # the schedule fires often; another run may have pushed meanwhile
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
-            git push
+          set -uo pipefail
+          [[ -f seen.json ]] || { echo "no seen.json to persist"; exit 0; }
+          if [[ -z "$(git status --porcelain seen.json)" ]]; then
+            echo "seen.json unchanged"; exit 0
           fi
+          git config user.name  "bot999"
+          git config user.email "bot999@users.noreply.github.com"
+          cp seen.json /tmp/ours.json
+          # our copy is safe in /tmp now - leave a clean tree so switching
+          # branches below can't be blocked by the modified/untracked file
+          git restore seen.json 2>/dev/null || rm -f seen.json
+          for attempt in 1 2 3; do
+            git fetch --quiet origin "$GITHUB_REF_NAME"
+            git checkout --quiet -B persist "origin/$GITHUB_REF_NAME"
+            python3 - <<'PY'
+          import json, pathlib
+          ours = json.loads(pathlib.Path("/tmp/ours.json").read_text())
+          p = pathlib.Path("seen.json")
+          theirs = json.loads(p.read_text()) if p.exists() else {}
+          p.write_text(json.dumps({
+              "seen": sorted(set(ours.get("seen", [])) | set(theirs.get("seen", [])))[-5000:],
+              "last_full_sweep": max(ours.get("last_full_sweep", 0),
+                                     theirs.get("last_full_sweep", 0)),
+              "updated": ours.get("updated", ""),
+          }, indent=0))
+          PY
+            if [[ -z "$(git status --porcelain seen.json)" ]]; then
+              echo "remote already has everything we know"; exit 0
+            fi
+            git add seen.json
+            git commit --quiet -m "chore: update seen listings [skip ci]"
+            if git push --quiet origin "HEAD:$GITHUB_REF_NAME"; then
+              echo "persisted on attempt $attempt"; exit 0
+            fi
+            echo "push race on attempt $attempt, retrying"
+          done
+          echo "could not persist seen.json after 3 attempts" >&2
+          exit 1
